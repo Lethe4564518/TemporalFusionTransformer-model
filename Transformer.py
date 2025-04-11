@@ -42,7 +42,7 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed(SEED)
     torch.cuda.manual_seed_all(SEED)            # 如果使用多個 GPU
     torch.backends.cudnn.deterministic = True   # 確保每次返回的卷積算法是確定的
-    torch.backends.cudnn.benchmark = False      # True 可提高計算速度，但使用隨機算法
+    torch.backends.cudnn.benchmark = False      # True 可提高計算速度，但是使用隨機算法
 
 # 設置 Python 的 hash seed
 os.environ['PYTHONHASHSEED'] = str(SEED)
@@ -663,7 +663,7 @@ if __name__ == '__main__':
             all_targets = []
             
             # 使用 val_dataloader 進行預測
-            ## ------------ DEBUG 區塊 ------------ ##
+            ## ------------ DEBUG 區塊 (移除會報錯) ------------ ##
             with torch.no_grad():
                 for batch_idx, batch in enumerate(val_dataloader):
                     # print(f"\n處理 batch {batch_idx + 1}:")

@@ -1,0 +1,40 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+env/
+venv/
+.venv/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# VS Code settings
+.vscode/
+
+# Logs and outputs
+*.log
+outputs/
+lightning_logs/
+
+# Model files
+*.h5
+*.pt
+*.ckpt
+*.pkl
+*.npz
+
+# Data
+data/
+*.csv
+*.xlsx
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Environment variables
+.env
+*.env
