@@ -2,38 +2,82 @@
 import os
 import sys
 import time
+import random
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.collections import LineCollection
+from scipy.interpolate import Rbf
 
 import torch
-from torch.utils.data import DataLoader
-
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import Callback, EarlyStopping, ModelCheckpoint
+from pytorch_lightning.callbacks import Callback, EarlyStopping, ModelCheckpoint, LearningRateMonitor
 from pytorch_forecasting import TimeSeriesDataSet, TemporalFusionTransformer, Baseline, QuantileLoss, NaNLabelEncoder
 from pytorch_forecasting.models.base_model import BaseModelWithCovariates
 from pytorch_forecasting.metrics import RMSE
+# from pytorch_forecasting.data import TorchNormalizer
 
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
+# from sklearn.preprocessing import MinMaxScaler, RobustScaler
 from sklearn.model_selection import GroupKFold
 from sklearn.decomposition import PCA
+# from sklearn.feature_selection import SelectKBest, f_regression
 
 from multiprocessing import freeze_support
 
 
 
 
-# ============================= 超參數設定 =============================
-SEQ_LEN = 12                # 編碼器序列長度
-PRED_LEN = 12                # 預測長度（預測下一期）
-BATCH_SIZE = 64
-NUM_EPOCHS = 50
-LR = 0.001
-N_SPLITS = 5                # GroupKFold 的 fold 數
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# ============================= 設置隨機種子 ============================= ##
+SEED = 42
 
-# sys.setrecursionlimit(10000)  # 增加遞歸限制
+# 設置 Python 內建的隨機種子
+random.seed(SEED)
+
+# 設置 NumPy 的隨機種子
+np.random.seed(SEED)
+
+# 設置 PyTorch 的隨機種子
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(SEED)
+    torch.cuda.manual_seed_all(SEED)            # 如果使用多個 GPU
+    torch.backends.cudnn.deterministic = True   # 確保每次返回的卷積算法是確定的
+    torch.backends.cudnn.benchmark = False      # True 可提高計算速度，但使用隨機算法
+
+# 設置 Python 的 hash seed
+os.environ['PYTHONHASHSEED'] = str(SEED)
+
+
+
+
+# ============================= 超參數設定 =============================
+# TFT 模型超參數
+SEQ_LEN = 24                 # 編碼器序列長度
+PRED_LEN = 24                # 預測長度（預測下一期）
+BATCH_SIZE = 32
+NUM_EPOCHS = 25
+LR = 0.0005
+N_SPLITS = 3                # GroupKFold 的 fold 數
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+HIDDEN_SIZE = 256
+ATTENTION_HEAD_SIZE = 32
+DROPOUT = 0.1
+HIDDEN_CONTINUOUS_SIZE = 128
+OUTPUT_SIZE = 1
+LOG_INTERVAL = 10
+WEIGHT_DECAY = 1e-5
+REDUCE_ON_PLATEAU_PATIENCE = 4
+
+# Trainer 超參數
+MAX_EPOCHS = NUM_EPOCHS
+ACCELERATOR = "gpu" if DEVICE=="cuda" else "auto"
+DEVICES = 1 if DEVICE=="cuda" else "auto"
+GRADIENT_CLIP_VAL = 0.5
+LIMIT_TRAIN_BATCHES = 1.0
+LIMIT_VAL_BATCHES = 1.0
+ACCUMULATE_GRAD_BATCHES = 4
+PRECISION = 32
+ENABLE_PROGRESS_BAR = True
 
 
 
@@ -83,6 +127,80 @@ def process_data(data):
         print(f'資料處理過程中發生錯誤: {str(e)}')
         return None
 
+
+# FIXME: 可考慮加入
+# 1. 添加技術指標
+def add_technical_features(df):
+    # 價格動量特徵
+    df['return_1m'] = df.groupby('股票代碼')['收盤價'].pct_change(1).fillna(0)    # 使用0填充
+    df['return_3m'] = df.groupby('股票代碼')['收盤價'].pct_change(3).fillna(0)
+    df['return_6m'] = df.groupby('股票代碼')['收盤價'].pct_change(6).fillna(0)
+    
+    # 波動率特徵 - 使用rolling計算前添加最小期數限制
+    df['volatility_3m'] = df.groupby('股票代碼')['月報酬率'].transform(
+        lambda x: x.rolling(3, min_periods=1).std()
+    ).fillna(0)
+    
+    df['volatility_6m'] = df.groupby('股票代碼')['月報酬率'].transform(
+        lambda x: x.rolling(6, min_periods=1).std()
+    ).fillna(0)
+    
+    # 相對強度指標 - 使用transform確保不會產生NA
+    df['rel_strength'] = df.groupby('股票代碼')['月報酬率'].transform(
+        lambda x: x - df.groupby('年月')['月報酬率'].transform('mean')
+    ).fillna(0)
+    
+    # 趨勢特徵 - 添加最小期數限制
+    df['ma5'] = df.groupby('股票代碼')['收盤價'].transform(
+        lambda x: x.rolling(5, min_periods=1).mean()
+    ).fillna(method='bfill').fillna(method='ffill')
+    
+    df['ma20'] = df.groupby('股票代碼')['收盤價'].transform(
+        lambda x: x.rolling(20, min_periods=1).mean()
+    ).fillna(method='bfill').fillna(method='ffill')
+    
+    # 避免除以零
+    df['price_trend'] = (df['ma5'] / df['ma20'] - 1).replace([np.inf, -np.inf], 0).fillna(0)
+    
+    return df
+
+
+# 2. 添加時間特徵
+def add_time_features(df):
+    # 基本時間特徵
+    df['month'] = df['年月'].dt.month
+    df['quarter'] = df['年月'].dt.quarter
+    
+    # 週期性編碼
+    df['month_sin'] = np.sin(2 * np.pi * df['month']/12)
+    df['month_cos'] = np.cos(2 * np.pi * df['month']/12)
+    
+    # 是否為季末月
+    df['is_quarter_end'] = df['month'].isin([3,6,9,12]).astype(int)
+    
+    return df
+
+df = add_technical_features(df)
+df = add_time_features(df)
+
+
+# # 3. 添加產業/市場特徵
+# def add_market_features(df):
+#     # 計算市場整體報酬
+#     df['market_return'] = df.groupby('年月')['月報酬率'].transform('mean')
+    
+#     return df
+
+
+# # 2. 處理時間序列的季節性
+# def add_seasonal_features(df):
+#     # 移除整體趨勢
+#     df['detrended_return'] = df.groupby('股票代碼')['月報酬率'].transform(
+#         lambda x: x - x.rolling(12).mean()
+#     )
+#     return df
+
+
 # 執行數據處理並檢查是否有缺失值
 processed_data = process_data(df)
 
@@ -91,11 +209,31 @@ exclude_cols = ['股票代碼', '股票名稱', '年月', '月報酬率']
 features = [col for col in df.columns if col not in exclude_cols]
 target = '月報酬率'
 
-# 標準化特徵
-# NOTE: 此處使用 MinMaxScaler 取代 StandardScaler
-# FIXME: panel data 是否適用 MinMaxScaler
-scaler = MinMaxScaler()
-df[features] = scaler.fit_transform(df[features])
+
+# 為了使 model 更穩定，先在外部標準化特徵
+# FIXME: 此處因應 panel data 使用 robust expanding minmax 並針對運算效能進行優化
+# 但因為預測效果不佳，模型傾向於預測0附近的值，故先不使用
+# def robust_expanding_minmax(group, min_periods=5):
+#     scaled = group.copy()
+
+#     for col in features:                                            # 對每個特徵進行標準化
+#         values = group[col]
+#         min_vals = values.expanding(min_periods=1).min()            # 計算累積最小值
+#         max_vals = values.expanding(min_periods=1).max()            # 計算累積最大值
+
+#         denom = (max_vals - min_vals).replace(0, np.nan) + 1e-8     # 避免分母為 0
+#         norm = (values - min_vals) / denom
+
+#         # fallback: 若時間點小於 min_periods 或全為 NaN，則設為 0.5
+#         fallback_mask = (values.expanding().count() < min_periods) | norm.isna()     # 若時間點小於 min_periods 或全為 NaN，則設為 0.5
+#         norm = norm.mask(fallback_mask, 0.5)
+
+#         scaled[col] = norm
+
+#     return scaled
+# # 每支股票獨立標準化且沒有 data leakage 的問題
+# df = df.groupby('股票代碼', group_keys=False).apply(robust_expanding_minmax)
+
 
 # 建立時間索引（每個股票代碼的資料按時間順序編號）
 df['time_idx'] = df.groupby('股票代碼').cumcount()
@@ -107,13 +245,16 @@ df['股票代碼'] = df['股票代碼'].astype(str)
 
 
 # ============================= 自訂 Callback 用於記錄 loss 與權重演變 =============================
+callback_list = []
 class RecordCallback(Callback):
     """ 記錄訓練與驗證 loss 與權重演變 """
     def __init__(self):
         super().__init__()
         self.train_losses = []
         self.val_losses = []
-        self.weight_history = []  # 記錄每個 epoch 結束時模型最後輸出層的權重
+        self.weight_history = []    # 記錄每個 epoch 結束時模型最後輸出層的權重
+        self.full_weights = []      # 每個 epoch 的全模型權重
+        self.loss_traj = []         # 損失值軌跡
 
     def on_train_epoch_end(self, trainer, pl_module):
         train_loss = trainer.callback_metrics.get("train_loss")
@@ -125,7 +266,9 @@ class RecordCallback(Callback):
     def on_validation_epoch_end(self, trainer, pl_module):
         val_loss = trainer.callback_metrics.get("val_loss")
         if val_loss is not None:
-            self.val_losses.append(val_loss.detach().cpu().item())
+            loss_value = val_loss.detach().cpu().item()
+            self.val_losses.append(loss_value)
+            self.loss_traj.append(loss_value)
         else:
             print("錯誤: 驗證集 loss 為 None\n")
 
@@ -141,6 +284,13 @@ class RecordCallback(Callback):
                 print(f"取得權重時發生錯誤: {str(e)}\n")
         if weight is not None:
             self.weight_history.append(weight)
+        
+        # 記錄全模型權重的向量
+        try:
+            full_vector = torch.nn.utils.parameters_to_vector(pl_module.parameters()).detach().cpu().numpy()
+            self.full_weights.append(full_vector)
+        except Exception as e:
+            print(f"記錄全模型權重時發生錯誤: {str(e)}\n")
 
 
 
@@ -277,6 +427,62 @@ def sharpe_ratio(returns):
 
 
 
+# ============================= 繪製 loss surface 上的權重軌跡 =============================
+def plot_best_loss_contour_trajectory(callback_list, all_val_losses, ax):
+    """
+    繪製最佳 fold 的模型在降維後 loss surface 上的權重演化軌跡
+    使用 2D 等高線 + 漸變軌跡
+    """
+    best_fold_idx = np.argmin([val_loss[-1] for val_loss in all_val_losses])
+    callback = callback_list[best_fold_idx]
+
+    weights = np.array(callback.full_weights)
+    losses = np.array(callback.loss_traj)
+
+    if len(weights) == 0 or len(losses) == 0:
+        print("尚未記錄任何模型權重或損失")
+        return
+
+    # 降維
+    pca = PCA(n_components=2)
+    weights_2d = pca.fit_transform(weights)
+
+    # RBF 插值來產生 loss contour
+    rbf = Rbf(weights_2d[:, 0], weights_2d[:, 1], losses, function='multiquadric', smooth=0.1)
+    x = np.linspace(weights_2d[:, 0].min() - 1, weights_2d[:, 0].max() + 1, 100)
+    y = np.linspace(weights_2d[:, 1].min() - 1, weights_2d[:, 1].max() + 1, 100)
+    X, Y = np.meshgrid(x, y)
+    Z = rbf(X, Y)
+
+    # 等高線圖
+    ax.contourf(X, Y, Z, levels=30, cmap="viridis", alpha=0.7)
+
+    # 漸變軌跡線條
+    points = weights_2d.reshape(-1, 1, 2)
+    segments = np.concatenate([points[:-1], points[1:]], axis=1)
+    norm = plt.Normalize(losses.min(), losses.max())
+    lc = LineCollection(segments, cmap='autumn', norm=norm)
+    lc.set_array(losses)
+    lc.set_linewidth(2)
+    ax.add_collection(lc)
+
+    # 起點：圓圈 + label
+    ax.scatter(weights_2d[0, 0], weights_2d[0, 1], color='blue', s=50, zorder=3)
+
+    # 終點：箭頭 + X + label
+    ax.annotate('', xy=weights_2d[-1], xytext=weights_2d[-2],
+                arrowprops=dict(arrowstyle='->', color='red', lw=2), zorder=3)
+    ax.scatter(weights_2d[-1, 0], weights_2d[-1, 1], marker='x', color='green', s=60, zorder=3)
+
+    ax.set_xlabel("Principal Component 1")
+    ax.set_ylabel("Principal Component 2")
+    ax.set_title(f"Best Fold Trajectory on Loss Contour (Fold {best_fold_idx + 1})")
+    ax.grid(True, alpha=0.3)
+
+
+
+
+
 # ============================= GroupKFold 交叉驗證 =============================
 # 以股票代碼作為分組依據
 unique_companies = df['股票代碼'].unique()
@@ -314,38 +520,42 @@ if __name__ == '__main__':
             time_idx="time_idx",
             target=target,
             group_ids=["股票代碼"],
-            min_encoder_length=SEQ_LEN,         # 最小 encoder 序列長度
-            max_encoder_length=SEQ_LEN,         # 固定 encoder 長度
+            min_encoder_length=SEQ_LEN,                     # 最小 encoder 序列長度
+            max_encoder_length=SEQ_LEN,                     # 固定 encoder 長度
             min_prediction_length=PRED_LEN,
             max_prediction_length=PRED_LEN,
             time_varying_known_reals=["time_idx"],
             time_varying_unknown_reals=features + [target],
             static_categoricals=["股票代碼"],
-            target_normalizer=None,  # 此例中直接預測原始標籤（也可標準化 ex. StandardScaler）
-            categorical_encoders={"股票代碼": NaNLabelEncoder(add_nan=True)}  # 添加 NaNLabelEncoder
+            target_normalizer=None,                         # 此例中直接預測原始標籤（也可標準化 ex. StandardScaler）
+            categorical_encoders={"股票代碼": NaNLabelEncoder(add_nan=True)},  # 添加 NaNLabelEncoder
+            allow_missing_timesteps=True,                   # 允許缺失的時間步
+            add_relative_time_idx=True,                     # 添加相對時間索引
         )
         
         # 驗證集：使用與訓練集相同的設定，但預測期間為最後一段
         validation = TimeSeriesDataSet.from_dataset(training, val_df, stop_randomization=True)
         
         # 建立 dataloader 
-        train_dataloader = training.to_dataloader(train=True, batch_size=BATCH_SIZE, num_workers=0)
-        val_dataloader = validation.to_dataloader(train=False, batch_size=BATCH_SIZE, num_workers=0)
+        train_dataloader = training.to_dataloader(train=True, batch_size=BATCH_SIZE, num_workers=0, pin_memory=True)
+        val_dataloader = validation.to_dataloader(train=False, batch_size=BATCH_SIZE, num_workers=0, pin_memory=True)
         
+
         ## --------------------------- ##
         # 建立 TFT 模型
-        # 使用 RMSE 作為 loss，可改用其他 loss 比如 QuantileLoss
+        # FIXME: 使用 RMSE 作為 loss，可改用其他 loss 比如 QuantileLoss
         tft_model = TemporalFusionTransformer.from_dataset(
             training,
             learning_rate=LR,
-            hidden_size=32,
-            attention_head_size=4,
-            dropout=0.1,
-            hidden_continuous_size=16,
-            output_size=1,
-            loss=RMSE(),
-            log_interval=10,
-            reduce_on_plateau_patience=4
+            hidden_size=HIDDEN_SIZE,                                # 隱藏層大小
+            attention_head_size=ATTENTION_HEAD_SIZE,                # attention head 大小
+            dropout=DROPOUT,                                        # dropout 率
+            hidden_continuous_size=HIDDEN_CONTINUOUS_SIZE,          # 連續特徵的隱藏層大小
+            output_size=OUTPUT_SIZE,                                # 輸出維度 (此例中為1，因為只預測1期)
+            loss=RMSE(),                                            # 使用 RMSE 作為 loss function
+            log_interval=LOG_INTERVAL,                              # 每 10 個 batch 記錄一次 loss
+            weight_decay=WEIGHT_DECAY,                              # L2 regularization
+            reduce_on_plateau_patience=REDUCE_ON_PLATEAU_PATIENCE   # 當驗證集 loss 不再下降時，減少學習率
         )
 
         # 將模型移到指定設備
@@ -361,7 +571,8 @@ if __name__ == '__main__':
 
         # 使用自訂 Callback 記錄 loss 與權重演變
         record_cb = RecordCallback()
-        
+        callback_list.append(record_cb)
+
         # Early stopping 與模型 checkpoint
         early_stop_cb = EarlyStopping(monitor="val_loss", patience=10, verbose=True, mode="min")
         checkpoint_cb = ModelCheckpoint(monitor="val_loss", save_top_k=1, mode="min")
@@ -369,17 +580,18 @@ if __name__ == '__main__':
         # 建立 Trainer
         trainer = pl.Trainer(
             max_epochs=NUM_EPOCHS,
-            accelerator="gpu" if DEVICE=="cuda" else "auto",
-            devices=1 if DEVICE=="cuda" else "auto",
+            accelerator=ACCELERATOR,
+            devices=DEVICES,
             callbacks=[record_cb, early_stop_cb, checkpoint_cb],
-            gradient_clip_val=0.1,
-            limit_train_batches=1.0,
-            limit_val_batches=1.0,
-            enable_progress_bar=True
+            gradient_clip_val=GRADIENT_CLIP_VAL,
+            limit_train_batches=LIMIT_TRAIN_BATCHES,
+            limit_val_batches=LIMIT_VAL_BATCHES,
+            accumulate_grad_batches=ACCUMULATE_GRAD_BATCHES,
+            precision=PRECISION,
+            enable_progress_bar=ENABLE_PROGRESS_BAR
         )
         
-        print(f'fold {fold+1} 訓練中...\n')
-        
+
         ## ------------ DEBUG 區塊 ------------ ##
         # BUG: 使用 QuantileLoss 時需檢查一個 batch 的 forward 與 loss 計算是否正常
         # debug_batch = next(iter(train_dataloader))
@@ -427,6 +639,7 @@ if __name__ == '__main__':
         # 如果沒有錯誤，再進行後續步驟
         ## -------------------------------------- ##
 
+        print(f'\nfold {fold+1} 訓練中...\n')
         trainer.fit(tft, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader)
         
         ## --------------------------- ##
@@ -676,7 +889,7 @@ if __name__ == '__main__':
 
 
 # ============================= 整體結果彙整與視覺化 =============================
-print("\n===== 結果彙整 =====")
+print("\n========== 結果彙整 ==========")
 all_rmse = []
 all_sharpe = []
 all_train_losses = []
@@ -706,75 +919,86 @@ avg_sharpe = np.mean(all_sharpe) if all_sharpe else np.nan
 print(f"總平均 RMSE: {avg_rmse:.4f}")
 print(f"總平均 Sharpe Ratio: {avg_sharpe:.4f}")
 
+
 # 一併繪製所有 fold 的結果
-plt.figure(figsize=(15, 10))
+fig = plt.figure(figsize=(18, 10))
 
 # 1. 繪製訓練與驗證 loss 曲線
-plt.subplot(2, 2, 1)
+ax1 = fig.add_subplot(221)
 for i, (train_loss, val_loss) in enumerate(zip(all_train_losses, all_val_losses)):
-    plt.plot(range(1, len(train_loss)+1), train_loss, label=f"Fold {i+1} Train", linestyle='-')
-    plt.plot(range(1, len(val_loss)+1), val_loss, label=f"Fold {i+1} Val", linestyle='--')
-plt.xlabel("Epoch")
-plt.ylabel("Loss")
-plt.title("Loss Curves for All Folds")
-plt.legend()
-plt.grid(True, alpha=0.3)
-# 確保即使 loss 很小也能顯示
-plt.ylim(bottom=0)  # 從0開始
-if len(all_train_losses) > 0 and len(all_train_losses[0]) > 0:
-    max_loss = max([max(loss) for loss in all_train_losses + all_val_losses])
-    plt.ylim(top=max_loss * 1.2)  # 設置上限為最大 loss 的1.2倍
+    ax1.plot(range(1, len(train_loss)+1), train_loss, label=f"Fold {i+1} Train")
+    ax1.plot(range(1, len(val_loss)+1), val_loss, label=f"Fold {i+1} Val", linestyle='--')
+ax1.set_xlabel("Epoch")
+ax1.set_ylabel("Loss")
+ax1.set_title("Loss Curves for All Folds")
+ax1.legend()
+ax1.grid(True, alpha=0.3)
+ax1.set_ylim(bottom=0)
 
 # 2. 繪製預測值 vs 實際值的散佈圖
-plt.subplot(2, 2, 2)
+ax2 = fig.add_subplot(222)
 for i, (pred, act) in enumerate(zip(all_predictions, all_actuals)):
-    plt.scatter(act.flatten(), pred.flatten(), alpha=0.6, label=f"Fold {i+1}")
-plt.plot([-0.2, 0.2], [-0.2, 0.2], "r--", label="Perfect Prediction")
-plt.xlabel("Actual Values")
-plt.ylabel("Predicted Values")
-plt.title("Prediction vs Actual Scatter Plot")
-plt.xlim(-0.2, 0.2)  # 限制x軸範圍為更合理的值
-plt.ylim(-0.2, 0.2)  # 限制y軸範圍為更合理的值
-plt.legend()
-plt.grid(True, alpha=0.3)
+    ax2.scatter(act.flatten(), pred.flatten(), alpha=0.6, label=f"Fold {i+1}", s=10)
+ax2.plot([-0.2, 0.2], [-0.2, 0.2], "r--", label="Perfect Prediction")
+ax2.set_xlabel("Actual Values")
+ax2.set_ylabel("Predicted Values")
+ax2.set_title("Prediction vs Actual Scatter Plot")
+ax2.set_xlim(-0.2, 0.2)
+ax2.set_ylim(-0.2, 0.2)
+ax2.legend()
+ax2.grid(True, alpha=0.3)
 
-# 3. 繪製權重演變的2D軌跡圖
-# FIXME: 無輸出
-plt.subplot(2, 2, 3)
-for i, res in enumerate(fold_results):
-    if len(res["weight_history"]) > 0:
-        weight_history = np.array(res["weight_history"])
-
-        # 確保有足夠的數據來擬合PCA
-        if weight_history.shape[0] >= 2:
-            pca = PCA(n_components=2)
-            weight_2d = pca.fit_transform(weight_history)
-            plt.plot(weight_2d[:,0], weight_2d[:,1], marker="o", label=f"Fold {i+1}")
-            # 添加箭頭來指示方向
-            plt.arrow(weight_2d[0,0], weight_2d[0,1], 
-                    weight_2d[-1,0]-weight_2d[0,0], weight_2d[-1,1]-weight_2d[0,1], 
-                    head_width=0.1, head_length=0.1, fc='k', ec='k')
-plt.xlabel("Principal Component 1")
-plt.ylabel("Principal Component 2")
-plt.title("Weight Evolution Trajectory")
-plt.legend()
-plt.grid(True, alpha=0.3)
+# 3. 繪製權重演變的3D軌跡圖
+ax3 = fig.add_subplot(223)
+for i, cb in enumerate(callback_list):
+    plot_best_loss_contour_trajectory(callback_list, all_val_losses, ax=ax3)
 
 # 4. 繪製 RMSE 和 Sharpe Ratio 的箱型圖
-plt.subplot(2, 2, 4)
+ax4 = fig.add_subplot(224)
 data = [all_rmse, all_sharpe]
-boxplot = plt.boxplot(data, labels=["RMSE", "Sharpe Ratio"])
-plt.title("Distribution of Evaluation Metrics")
-# 添加數值標籤
-for i, d in enumerate(data):
-    if d:  # 確保有數據
+boxplot = ax4.boxplot(data, tick_labels=["RMSE", "Sharpe Ratio"])
+ax4.set_title("Distribution of Evaluation Metrics")
+
+for i, d in enumerate(data):    # 增加數值標籤
+    if d:
         y = np.mean(d)
-        plt.text(i+1, y, f'Mean: {y:.4f}', 
+        ax4.text(i+1, y, f'Mean: {y:.4f}', 
                 horizontalalignment='center', 
                 verticalalignment='bottom')
-plt.grid(True, alpha=0.3)
+ax4.grid(True, alpha=0.3)
 
 # 調整子圖之間的間距
 plt.tight_layout()
-plt.savefig('evaluation_results.png', dpi=300)
-# plt.show()
+plt.savefig('evaluation_results.png', dpi=300, bbox_inches='tight')
+
+
+
+# ============================= 列出所有超參數 =============================
+print("\n========== TFT 模型超參數 ==========")
+print(f"SEQ_LEN: {SEQ_LEN}")
+print(f"PRED_LEN: {PRED_LEN}")
+print(f"BATCH_SIZE: {BATCH_SIZE}")
+print(f"NUM_EPOCHS: {NUM_EPOCHS}")
+print(f"LR: {LR}")
+print(f"N_SPLITS: {N_SPLITS}")
+print(f"DEVICE: {DEVICE}")
+print(f"HIDDEN_SIZE: {HIDDEN_SIZE}")
+print(f"ATTENTION_HEAD_SIZE: {ATTENTION_HEAD_SIZE}")
+print(f"DROPOUT: {DROPOUT}")
+print(f"HIDDEN_CONTINUOUS_SIZE: {HIDDEN_CONTINUOUS_SIZE}")
+print(f"OUTPUT_SIZE: {OUTPUT_SIZE}")
+print(f"LOG_INTERVAL: {LOG_INTERVAL}")
+print(f"WEIGHT_DECAY: {WEIGHT_DECAY}")
+print(f"REDUCE_ON_PLATEAU_PATIENCE: {REDUCE_ON_PLATEAU_PATIENCE}")
+
+print("\n========== Trainer 超參數 ==========")
+print(f"MAX_EPOCHS: {MAX_EPOCHS}")
+print(f"ACCELERATOR: {ACCELERATOR}")
+print(f"DEVICES: {DEVICES}")
+print(f"GRADIENT_CLIP_VAL: {GRADIENT_CLIP_VAL}")
+print(f"LIMIT_TRAIN_BATCHES: {LIMIT_TRAIN_BATCHES}")
+print(f"LIMIT_VAL_BATCHES: {LIMIT_VAL_BATCHES}")
+print(f"ACCUMULATE_GRAD_BATCHES: {ACCUMULATE_GRAD_BATCHES}")
+print(f"PRECISION: {PRECISION}")
+print(f"ENABLE_PROGRESS_BAR: {ENABLE_PROGRESS_BAR}")
+
