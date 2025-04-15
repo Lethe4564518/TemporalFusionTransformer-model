@@ -52,21 +52,21 @@ os.environ['PYTHONHASHSEED'] = str(SEED)
 
 # ============================= 超參數設定 =============================
 # TFT 模型超參數
-SEQ_LEN = 24                 # 編碼器序列長度
-PRED_LEN = 24                # 預測長度（預測下一期）
-BATCH_SIZE = 32
-NUM_EPOCHS = 25
+SEQ_LEN = 24                        # 編碼器序列長度
+PRED_LEN = 24                       # 預測長度（預測下一期）
+BATCH_SIZE = 128
+NUM_EPOCHS = 50
 LR = 0.0005
-N_SPLITS = 3                # GroupKFold 的 fold 數
+N_SPLITS = 3                        # GroupKFold 的 fold 數
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-HIDDEN_SIZE = 256
-ATTENTION_HEAD_SIZE = 32
-DROPOUT = 0.1
-HIDDEN_CONTINUOUS_SIZE = 128
-OUTPUT_SIZE = 1
-LOG_INTERVAL = 10
-WEIGHT_DECAY = 1e-5
-REDUCE_ON_PLATEAU_PATIENCE = 4
+HIDDEN_SIZE = 256                   # 隱藏層大小
+ATTENTION_HEAD_SIZE = 64            # 注意力頭大小
+DROPOUT = 0.1                       # 隨機丟棄神經元機率
+HIDDEN_CONTINUOUS_SIZE = 256        # 連續隱藏層大小
+OUTPUT_SIZE = 1                     # 輸出大小
+LOG_INTERVAL = 10                   # 記錄間隔
+WEIGHT_DECAY = 1e-6                 # 權重衰減
+REDUCE_ON_PLATEAU_PATIENCE = 5      # 當驗證集 loss 不再下降時，減少學習率
 
 # Trainer 超參數
 MAX_EPOCHS = NUM_EPOCHS
@@ -482,7 +482,6 @@ def plot_best_loss_contour_trajectory(callback_list, all_val_losses, ax):
 
 
 
-
 # ============================= GroupKFold 交叉驗證 =============================
 # 以股票代碼作為分組依據
 unique_companies = df['股票代碼'].unique()
@@ -593,7 +592,7 @@ if __name__ == '__main__':
         
 
         ## ------------ DEBUG 區塊 ------------ ##
-        # BUG: 使用 QuantileLoss 時需檢查一個 batch 的 forward 與 loss 計算是否正常
+        # NOTE: 使用 QuantileLoss 時需檢查一個 batch 的 forward 與 loss 計算是否正常
         # debug_batch = next(iter(train_dataloader))
         # debug_batch = tft._move_batch_to_device(debug_batch)  # 使用 wrapper 中的函數將 batch 移到正確設備
 
