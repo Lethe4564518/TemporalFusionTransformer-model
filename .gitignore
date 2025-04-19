@@ -8,8 +8,9 @@ env/
 venv/
 .venv/
 
-# Jupyter Notebook checkpoints
+# checkpoints
 .ipynb_checkpoints/
+checkpoints/
 
 # VS Code settings
 .vscode/
@@ -18,6 +19,7 @@ venv/
 *.log
 outputs/
 lightning_logs/
+trainer_logs/
 
 # Model files
 *.h5
