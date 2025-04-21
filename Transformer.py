@@ -15,12 +15,8 @@ from pytorch_lightning.callbacks import Callback, EarlyStopping, ModelCheckpoint
 from pytorch_forecasting import TimeSeriesDataSet, TemporalFusionTransformer, Baseline, QuantileLoss, NaNLabelEncoder
 from pytorch_forecasting.models.base_model import BaseModelWithCovariates
 from pytorch_forecasting.metrics import RMSE
-# from pytorch_forecasting.data import TorchNormalizer
 
-# from sklearn.preprocessing import MinMaxScaler, RobustScaler
-# from sklearn.model_selection import GroupKFold
 from sklearn.decomposition import PCA
-# from sklearn.feature_selection import SelectKBest, f_regression
 
 from multiprocessing import freeze_support
 import dill
@@ -34,23 +30,23 @@ import torch.serialization
 SEQ_LEN = 24                        # 編碼器序列長度
 PRED_LEN = 24                       # 預測長度（預測下一期）
 BATCH_SIZE = 128
-NUM_EPOCHS = 20
+NUM_EPOCHS = 100
 LR = 0.001
-N_SPLITS = 3                        # GroupKFold 的 fold 數
+N_SPLITS = 10                        # GroupKFold 的 fold 數
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 HIDDEN_SIZE = 256                   # 隱藏層大小
 ATTENTION_HEAD_SIZE = 16            # attention head 大小
-DROPOUT = 0.05                      # 隨機丟棄神經元機率
-HIDDEN_CONTINUOUS_SIZE = 256        # 連續特徵的隱藏層大小
+DROPOUT = 0.03                      # 隨機丟棄神經元機率
+HIDDEN_CONTINUOUS_SIZE = 128        # 連續特徵的隱藏層大小
 OUTPUT_SIZE = 1                     # 輸出大小 (僅預測下一期報酬率)
 LOG_INTERVAL = 10                   # 記錄間隔
 WEIGHT_DECAY = 1e-6                 # 降低權重衰減以允許更極端的權重值
-REDUCE_ON_PLATEAU_PATIENCE = 5      # 當驗證集 loss 不再下降時，減少學習率
+REDUCE_ON_PLATEAU_PATIENCE = 5      # 當驗證集的 loss 不再下降時，減少學習率
 LOSS_ALPHA = 0.4                    # RMSE 損失權重
 LOSS_BETA = 0.3                     # MAE 損失權重
 LOSS_GAMMA = 0.15                    # 極值鼓勵權重
 LOSS_DELTA = 0.15                    # 分布懲罰權重 (過於集中時會增加損失)
-EXTREME_THRESHOLD = 0.1             # 極值閾值
+EXTREME_THRESHOLD = 0.08             # 極值閾值
 
 
 # Trainer 超參數
@@ -294,7 +290,8 @@ df['股票代碼'] = df['股票代碼'].astype(str)
 
 # ============================= 自定義損失函數 =============================
 class ExtremePredictionLoss(RMSE):
-    """ 改進的損失函數，結合多個目標：
+    """ 
+    改進的損失函數，結合多個目標：
     1. RMSE 作為基礎
     2. MAE 損失（對極值更敏感）
     3. 極值鼓勵項（當預測接近實際極值時減少損失）
@@ -375,6 +372,7 @@ class ExtremePredictionLoss(RMSE):
 
 
 
+
 # ============================= 自訂 Callback 用於記錄 loss 與權重演變 =============================
 callback_list = []
 class RecordCallback(Callback):
@@ -426,25 +424,24 @@ class RecordCallback(Callback):
 
 
 
-# ============================= 檢查模型中所有組件的設備狀態 =============================
-def check_model_devices(model):
-    """ 檢查模型中所有組件的設備狀態, Debug 用 """
-    print("\n模型組件設備狀態:")
-    for name, param in model.named_parameters():
-        print(f"{name}: {param.device}")
-    for name, buffer in model.named_buffers():
-        print(f"{name} (buffer): {buffer.device}")
+# ============================= Debug: 檢查模型中所有組件的設備狀態 =============================
+# def check_model_devices(model):
+#     """ 檢查模型中所有組件的設備狀態, Debug 用 """
+#     print("\n模型組件設備狀態:")
+#     for name, param in model.named_parameters():
+#         print(f"{name}: {param.device}")
+#     for name, buffer in model.named_buffers():
+#         print(f"{name} (buffer): {buffer.device}")
 
 
 
 
 # ============================= 自訂 LightningModule 用於 TFT 模型 =============================
-# FIXME: 需要加入權重的提取方式
 class TFTLightningWrapper(pl.LightningModule):
     """
-    自訂 TFTLightningWrapper 類別
-    修復直接使用 TemporalFusionTransformer.from_dataset() 建構 LightningModule 類別的模型時
-    training_step 和 validation_step 中的 batch 類型不匹配問題
+    自訂 TFTLightningWrapper 類別，
+    修復直接使用 TemporalFusionTransformer.from_dataset() 建構 LightningModule 類別的模型時，
+    training_step 和 validation_step 中的 batch 類型不匹配問題。
     """
     def __init__(self, model: BaseModelWithCovariates) -> None:
         super().__init__()
@@ -561,8 +558,8 @@ def sharpe_ratio(returns):
 # ============================= 繪製 loss surface 上的權重軌跡 =============================
 def plot_best_loss_contour_trajectory(callback_list, all_val_losses, ax):
     """
-    繪製最佳 fold 的模型在降維後 loss surface 上的權重演化軌跡
-    使用 2D 等高線 + 漸變軌跡
+    繪製最佳 fold 的模型在降維後 loss surface 上的權重演化軌跡，
+    使用 2D 等高線圖 + 權重漸變軌跡線條 + 起點圓圈 + 終點X 來繪製。
     """
     best_fold_idx = np.argmin([val_loss[-1] for val_loss in all_val_losses])
     callback = callback_list[best_fold_idx]
@@ -574,14 +571,20 @@ def plot_best_loss_contour_trajectory(callback_list, all_val_losses, ax):
         print("尚未記錄任何模型權重或損失")
         return
 
-    # 降維
+    # 使用 PCA 降維
     pca = PCA(n_components=2)
     weights_2d = pca.fit_transform(weights)
 
+    # 計算坐標軸範圍，增加 20% 的邊距
+    x_min = weights_2d[:, 0].min() - 0.2 * abs(weights_2d[:, 0].max() - weights_2d[:, 0].min())
+    x_max = weights_2d[:, 0].max() + 0.2 * abs(weights_2d[:, 0].max() - weights_2d[:, 0].min())
+    y_min = weights_2d[:, 1].min() - 0.2 * abs(weights_2d[:, 1].max() - weights_2d[:, 1].min())
+    y_max = weights_2d[:, 1].max() + 0.2 * abs(weights_2d[:, 1].max() - weights_2d[:, 1].min())
+
     # RBF 插值來產生 loss contour
     rbf = Rbf(weights_2d[:, 0], weights_2d[:, 1], losses, function='multiquadric', smooth=0.1)
-    x = np.linspace(weights_2d[:, 0].min() - 1, weights_2d[:, 0].max() + 1, 100)
-    y = np.linspace(weights_2d[:, 1].min() - 1, weights_2d[:, 1].max() + 1, 100)
+    x = np.linspace(x_min, x_max, 100)
+    y = np.linspace(y_min, y_max, 100)
     X, Y = np.meshgrid(x, y)
     Z = rbf(X, Y)
 
@@ -608,13 +611,15 @@ def plot_best_loss_contour_trajectory(callback_list, all_val_losses, ax):
     ax.set_xlabel("Principal Component 1")
     ax.set_ylabel("Principal Component 2")
     ax.set_title(f"Best Fold Trajectory on Loss Contour (Fold {best_fold_idx + 1})")
+    ax.set_xlim(x_min, x_max)
+    ax.set_ylim(y_min, y_max)
     ax.grid(True, alpha=0.3)
 
 
 
 
 # ============================= GroupKFold 交叉驗證 =============================
-# # 以股票代碼作為分組依據
+# # 以股票代碼作為分組依據，但可能導致每個 fold 的數據表現相差過大，暫不使用
 # unique_companies = df['股票代碼'].unique()
 # gkf = GroupKFold(n_splits=N_SPLITS)
 # fold_results = []
@@ -629,7 +634,7 @@ def plot_best_loss_contour_trajectory(callback_list, all_val_losses, ax):
 
 
 # ============================= 時間感知型分組交叉驗證 =============================
-def time_aware_group_split(df, n_splits=5):
+def time_aware_group_split(df, n_splits=N_SPLITS):
     """ 時間感知的分組交叉驗證 """
     # 按時間排序並分段
     df = df.sort_values('年月')
@@ -699,11 +704,12 @@ def time_aware_group_split(df, n_splits=5):
 
 
 
-# ============================= 開始交叉驗證 =============================
+# ============================= 開始交叉驗證並訓練模型 =============================
 fold_results = []
 if __name__ == '__main__':
     freeze_support()
     
+    # 使用時間感知型的分組交叉驗證
     for fold, (train_comp_idx, val_comp_idx) in enumerate(time_aware_group_split(df, n_splits=N_SPLITS)):
         print(f"\n============ Fold {fold+1} ============")
         # 取得該 fold 的股票代碼
@@ -744,8 +750,6 @@ if __name__ == '__main__':
             categorical_encoders={"股票代碼": NaNLabelEncoder(add_nan=True)},  # 添加 NaNLabelEncoder
             allow_missing_timesteps=True,                   # 允許缺失的時間步
             add_relative_time_idx=True,                     # 添加相對時間索引
-
-
         )
         
         # 驗證集：使用與訓練集相同的設定，但預測期間為最後一段
@@ -758,7 +762,6 @@ if __name__ == '__main__':
 
         ## --------------------------- ##
         # 建立 TFT 模型
-        # FIXME: 使用 RMSE 作為 loss，可改用其他 loss 比如 QuantileLoss
         tft_model = TemporalFusionTransformer.from_dataset(
             training,
             learning_rate=LR,
@@ -868,10 +871,10 @@ if __name__ == '__main__':
         # FIXME: 使用驗證集來評估，但驗證集的資料量過少可能導致評估結果不準確
         try:
             print("\n開始評估...")
+            tft = tft.to(DEVICE)
             tft.model.eval()  # 設置模型為評估模式
             tft.model = tft.model.to(DEVICE)
-            tft = tft.to(DEVICE)
-            
+
             # 檢查模型設備狀態
             # check_model_devices(tft.model)
             
@@ -1041,11 +1044,11 @@ if __name__ == '__main__':
             ## -------------------------------------- ##
             
 
-            # Concatenate all predictions and targets
+            # 將所有預測和目標值拼接成一個大張量
             predictions = np.concatenate(all_predictions, axis=0)
             actuals = np.concatenate(all_targets, axis=0)
             
-            # Print shapes
+            # print 預測和目標值的形狀
             print(f"Predictions shape: {predictions.shape}")
             print(f"Actuals shape: {actuals.shape}")
 
@@ -1054,7 +1057,7 @@ if __name__ == '__main__':
                 predictions = predictions.squeeze(-1)  # 移除最後一個維度
                 print(f"調整後的 Predictions 形狀: {predictions.shape}")
             
-            # Calculate metrics
+            # 計算指標
             fold_rmse = rmse_metric(actuals, predictions)
             fold_sharpe = sharpe_ratio(predictions - actuals)
             
@@ -1066,11 +1069,11 @@ if __name__ == '__main__':
             print(f"\n評估過程發生錯誤: {str(e)}")
             print("\nDebug information:")
             
-            # Check model state
+            # 檢查模型狀態
             print("Model device:", next(tft.model.parameters()).device)
             print("Model mode:", "eval" if tft.model.training is False else "train")
             
-            # 檢查數據加載器細節
+            # 檢查數據加載器細節，Debug 用
             # print("\n數據加載器:")
             # for i, batch in enumerate(val_dataloader):
             #     if i >= 3:  # 只打印前3個 batch
@@ -1300,9 +1303,9 @@ ax4.grid(True, alpha=0.3)
 
 # 調整子圖之間的間距
 plt.tight_layout()
-plt.savefig('evaluation_results2.png', dpi=300, bbox_inches='tight')
+plt.savefig('evaluation_results.png', dpi=300, bbox_inches='tight')
 plt.close(fig)
-print("evaluation_results2.png 保存完成\n")
+print("evaluation_results.png 保存完成\n")
 
 # 單獨生成過擬合分析圖表
 if all_train_losses and all_val_losses:
